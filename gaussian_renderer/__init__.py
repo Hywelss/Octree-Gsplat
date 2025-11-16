@@ -96,6 +96,71 @@ def build_rotation(r):
     R[:, 2, 2] = 1 - 2 * (x * x + y * y)
     return R
 
+def _empty_gaussian_splits(anchor: torch.Tensor, grid_scaling: torch.Tensor, color: torch.Tensor, scale_rot: torch.Tensor, offsets: torch.Tensor):
+    """Create shape-consistent empty tensors for gaussian parameter splits."""
+    return (
+        grid_scaling.new_empty((0, grid_scaling.shape[-1])),
+        anchor.new_empty((0, anchor.shape[-1])),
+        color.new_empty((0, color.shape[-1])),
+        scale_rot.new_empty((0, scale_rot.shape[-1])),
+        offsets.new_empty((0, offsets.shape[-1])),
+    )
+
+
+def _split_masked_gaussians_reference(anchor, grid_scaling, color, scale_rot, offsets, mask, num_offsets):
+    """Reference implementation that mimics the original masking logic (used for testing)."""
+    if anchor.shape[0] == 0 or num_offsets == 0 or mask.numel() == 0:
+        return _empty_gaussian_splits(anchor, grid_scaling, color, scale_rot, offsets)
+
+    mask = mask.view(-1).to(torch.bool)
+    if color.shape[0] != mask.shape[0]:
+        raise ValueError("Mask length must match flattened gaussian attributes")
+    if not mask.any():
+        return _empty_gaussian_splits(anchor, grid_scaling, color, scale_rot, offsets)
+
+    concatenated = torch.cat([grid_scaling, anchor], dim=-1)
+    concatenated_repeated = repeat(concatenated, 'n c -> (n k) c', k=num_offsets)
+    concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
+    masked = concatenated_all[mask]
+    return masked.split([grid_scaling.shape[-1], anchor.shape[-1], color.shape[-1], scale_rot.shape[-1], offsets.shape[-1]], dim=-1)
+
+
+def _split_masked_gaussians_vectorized(anchor, grid_scaling, color, scale_rot, offsets, mask, num_offsets):
+    """Vectorized gather that builds gaussian tensors via advanced indexing only."""
+    num_offsets = int(num_offsets)
+    mask = mask.view(-1).to(torch.bool)
+    total_candidates = mask.shape[0]
+
+    if (
+        num_offsets <= 0
+        or anchor.shape[0] == 0
+        or total_candidates == 0
+        or color.shape[0] == 0
+        or scale_rot.shape[0] == 0
+        or offsets.shape[0] == 0
+    ):
+        return _empty_gaussian_splits(anchor, grid_scaling, color, scale_rot, offsets)
+
+    if color.shape[0] != total_candidates or scale_rot.shape[0] != total_candidates or offsets.shape[0] != total_candidates:
+        raise ValueError("All flattened gaussian attributes must align with the mask length")
+
+    if not mask.any():
+        return _empty_gaussian_splits(anchor, grid_scaling, color, scale_rot, offsets)
+
+    repeated_scaling = repeat(grid_scaling, 'n c -> (n k) c', k=num_offsets).contiguous()
+    repeated_anchor = repeat(anchor, 'n c -> (n k) c', k=num_offsets).contiguous()
+
+    active_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1).to(torch.long)
+
+    selected_scaling = torch.index_select(repeated_scaling, 0, active_indices).contiguous()
+    selected_anchor = torch.index_select(repeated_anchor, 0, active_indices).contiguous()
+    selected_color = torch.index_select(color, 0, active_indices).contiguous()
+    selected_scale_rot = torch.index_select(scale_rot, 0, active_indices).contiguous()
+    selected_offsets = torch.index_select(offsets, 0, active_indices).contiguous()
+
+    return selected_scaling, selected_anchor, selected_color, selected_scale_rot, selected_offsets
+
+
 def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False,  ape_code=-1):
     ## view frustum filtering for acceleration    
     if visible_mask is None:
@@ -191,13 +256,23 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     
     # offsets
     offsets = grid_offsets.view([-1, 3]) # [mask]
-    
-    # combine for parallel masking
-    concatenated = torch.cat([grid_scaling, anchor], dim=-1)
-    concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
-    masked = concatenated_all[mask]
-    scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
+
+    # gather gaussian parameters purely via index tensors
+    (
+        scaling_repeat,
+        repeat_anchor,
+        color,
+        scale_rot,
+        offsets,
+    ) = _split_masked_gaussians_vectorized(
+        anchor=anchor,
+        grid_scaling=grid_scaling,
+        color=color,
+        scale_rot=scale_rot,
+        offsets=offsets,
+        mask=mask,
+        num_offsets=pc.n_offsets,
+    )
     
     # post-process cov
     scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
