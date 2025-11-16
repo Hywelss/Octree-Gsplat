@@ -147,13 +147,24 @@ def _split_masked_gaussians_vectorized(anchor, grid_scaling, color, scale_rot, o
     if not mask.any():
         return _empty_gaussian_splits(anchor, grid_scaling, color, scale_rot, offsets)
 
-    repeated_scaling = repeat(grid_scaling, 'n c -> (n k) c', k=num_offsets).contiguous()
-    repeated_anchor = repeat(anchor, 'n c -> (n k) c', k=num_offsets).contiguous()
-
     active_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1).to(torch.long)
 
-    selected_scaling = torch.index_select(repeated_scaling, 0, active_indices).contiguous()
-    selected_anchor = torch.index_select(repeated_anchor, 0, active_indices).contiguous()
+    if total_candidates % num_offsets != 0:
+        raise ValueError(
+            "Mask length must be divisible by num_offsets to map back to anchors"
+        )
+    num_anchors = total_candidates // num_offsets
+    if anchor.shape[0] != num_anchors or grid_scaling.shape[0] != num_anchors:
+        raise ValueError(
+            "Anchor and grid scaling lengths must match mask-derived anchor count"
+        )
+
+    anchor_indices = torch.div(
+        active_indices, num_offsets, rounding_mode="floor"
+    )
+
+    selected_scaling = torch.index_select(grid_scaling, 0, anchor_indices).contiguous()
+    selected_anchor = torch.index_select(anchor, 0, anchor_indices).contiguous()
     selected_color = torch.index_select(color, 0, active_indices).contiguous()
     selected_scale_rot = torch.index_select(scale_rot, 0, active_indices).contiguous()
     selected_offsets = torch.index_select(offsets, 0, active_indices).contiguous()
