@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # *Octree*-GS: Towards Consistent Real-time Rendering with LOD-Structured 3D Gaussians
 
 ### [Project Page](https://city-super.github.io/octree-gs/) | [Paper](https://arxiv.org/abs/2403.17898) | [Viewers for Windows](https://drive.google.com/file/d/12jg6Upko_pAfX3f4jgnb1Q2BhSQDPScE/view?usp=sharing) | [Viewers for Linux](https://github.com/YZsZY/OctreeGS-Ubuntu-Viewer)
@@ -274,3 +275,6 @@ Please follow the LICENSE of [3D-GS](https://github.com/graphdeco-inria/gaussian
 ## Acknowledgement
 
 We thank all authors from [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting) and [Scaffold-GS](https://github.com/city-super/Scaffold-GS) for presenting such an excellent work. Also, we thank the author of [Ubuntu-Viewer](https://github.com/YZsZY/OctreeGS-Ubuntu-Viewer) for adapting to linux system.
+=======
+# Octree-Gsplat
+>>>>>>> 5e9939fa7737b9fbf8e78ddffae4a93e291ab5eb
