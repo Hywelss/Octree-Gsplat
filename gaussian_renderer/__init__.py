@@ -315,6 +315,60 @@ def _render_with_gsplat(
     neural_opacity: Optional[torch.Tensor],
     mask: Optional[torch.Tensor],
 ):
+    use_tiles = (
+        getattr(pipe, "enable_tiling", False)
+        and getattr(pipe, "tile_size", 0) > 0
+        and not retain_grad
+        and not is_training
+    )
+    if use_tiles:
+        return _render_with_gsplat_tiled(
+            viewpoint_camera=viewpoint_camera,
+            pc=pc,
+            pipe=pipe,
+            bg_color=bg_color,
+            scaling_modifier=scaling_modifier,
+            retain_grad=retain_grad,
+            xyz=xyz,
+            color=color,
+            opacity=opacity,
+            scaling=scaling,
+            rot=rot,
+        )
+    return _render_with_gsplat_single(
+        viewpoint_camera=viewpoint_camera,
+        pc=pc,
+        pipe=pipe,
+        bg_color=bg_color,
+        scaling_modifier=scaling_modifier,
+        retain_grad=retain_grad,
+        xyz=xyz,
+        color=color,
+        opacity=opacity,
+        scaling=scaling,
+        rot=rot,
+        is_training=is_training,
+        neural_opacity=neural_opacity,
+        mask=mask,
+    )
+
+
+def _render_with_gsplat_single(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    scaling_modifier: float,
+    retain_grad: bool,
+    xyz: torch.Tensor,
+    color: torch.Tensor,
+    opacity: torch.Tensor,
+    scaling: torch.Tensor,
+    rot: torch.Tensor,
+    is_training: bool,
+    neural_opacity: Optional[torch.Tensor],
+    mask: Optional[torch.Tensor],
+):
     if xyz.numel() == 0:
         height = int(viewpoint_camera.image_height)
         width = int(viewpoint_camera.image_width)
@@ -413,6 +467,162 @@ def _render_with_gsplat(
             }
         )
     return result
+
+
+def _render_with_gsplat_tiled(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    scaling_modifier: float,
+    retain_grad: bool,
+    xyz: torch.Tensor,
+    color: torch.Tensor,
+    opacity: torch.Tensor,
+    scaling: torch.Tensor,
+    rot: torch.Tensor,
+):
+    device = xyz.device
+    dtype = xyz.dtype
+    width = int(viewpoint_camera.image_width)
+    height = int(viewpoint_camera.image_height)
+
+    tile_size = max(int(getattr(pipe, "tile_size", 0)), 1)
+    tile_overlap = max(int(getattr(pipe, "tile_overlap", 0)), 0)
+
+    tile_assignments, tiles_x, tiles_y = _compute_tile_assignments(
+        viewpoint_camera=viewpoint_camera,
+        xyz=xyz,
+        scaling=scaling,
+        scaling_modifier=scaling_modifier,
+        width=width,
+        height=height,
+        tile_size=tile_size,
+        tile_overlap=tile_overlap,
+    )
+
+    rendered_image = bg_color.view(1, -1, 1, 1)
+    rendered_image = rendered_image.expand(1, -1, height, width).clone()
+    rendered_image = rendered_image.squeeze(0)
+
+    total_gaussians = xyz.shape[0]
+    viewspace_points = xyz.new_zeros((total_gaussians, 3))
+    visibility_filter = torch.zeros((total_gaussians,), dtype=torch.bool, device=device)
+    radii = torch.zeros((total_gaussians,), dtype=dtype, device=device)
+
+    for tile_id, indices in enumerate(tile_assignments):
+        tile_y = tile_id // tiles_x
+        tile_x = tile_id % tiles_x
+        y0 = tile_y * tile_size
+        y1 = min((tile_y + 1) * tile_size, height)
+        x0 = tile_x * tile_size
+        x1 = min((tile_x + 1) * tile_size, width)
+
+        if not indices:
+            continue
+
+        idx_tensor = torch.tensor(indices, device=device, dtype=torch.long)
+        tile_result = _render_with_gsplat_single(
+            viewpoint_camera=viewpoint_camera,
+            pc=pc,
+            pipe=pipe,
+            bg_color=bg_color,
+            scaling_modifier=scaling_modifier,
+            retain_grad=retain_grad,
+            xyz=torch.index_select(xyz, 0, idx_tensor),
+            color=torch.index_select(color, 0, idx_tensor),
+            opacity=torch.index_select(opacity, 0, idx_tensor),
+            scaling=torch.index_select(scaling, 0, idx_tensor),
+            rot=torch.index_select(rot, 0, idx_tensor),
+            is_training=False,
+            neural_opacity=None,
+            mask=None,
+        )
+
+        rendered_image[:, y0:y1, x0:x1] = tile_result["render"][
+            :, y0:y1, x0:x1
+        ]
+        viewspace_points[idx_tensor] = tile_result["viewspace_points"]
+        visibility_filter[idx_tensor] |= tile_result["visibility_filter"]
+        radii[idx_tensor] = torch.maximum(radii[idx_tensor], tile_result["radii"])
+
+    return {
+        "render": rendered_image,
+        "viewspace_points": viewspace_points,
+        "visibility_filter": visibility_filter,
+        "radii": radii,
+    }
+
+
+def _compute_tile_assignments(
+    viewpoint_camera,
+    xyz: torch.Tensor,
+    scaling: torch.Tensor,
+    scaling_modifier: float,
+    width: int,
+    height: int,
+    tile_size: int,
+    tile_overlap: int,
+):
+    tiles_x = math.ceil(width / tile_size)
+    tiles_y = math.ceil(height / tile_size)
+
+    ones = torch.ones_like(xyz[:, :1])
+    hom = torch.cat([xyz, ones], dim=1)
+    clip = hom @ viewpoint_camera.full_proj_transform
+    w = clip[:, 3:4].clamp(min=1e-6)
+    ndc = torch.nan_to_num(clip[:, :3] / w, nan=0.0, posinf=0.0, neginf=0.0)
+    screen_x = (ndc[:, 0] * 0.5 + 0.5) * width
+    screen_y = (ndc[:, 1] * -0.5 + 0.5) * height
+
+    cam = hom @ viewpoint_camera.world_view_transform
+    depth = torch.nan_to_num(cam[:, 2].abs(), nan=1.0, posinf=1.0, neginf=1.0)
+    depth = depth.clamp(min=1e-3)
+
+    if scaling.dim() == 1:
+        base_scale = scaling
+    else:
+        base_scale = scaling[:, :3]
+    if base_scale.dim() == 1:
+        world_scale = base_scale.abs()
+    else:
+        world_scale = base_scale.abs().amax(dim=-1)
+    world_scale = world_scale * scaling_modifier
+
+    fx = fov2focal(viewpoint_camera.FoVx, width)
+    fy = fov2focal(viewpoint_camera.FoVy, height)
+    radius_x = torch.nan_to_num(fx * world_scale / depth, nan=0.0)
+    radius_y = torch.nan_to_num(fy * world_scale / depth, nan=0.0)
+
+    x_min = torch.clamp(screen_x - radius_x, 0.0, width - 1.0)
+    x_max = torch.clamp(screen_x + radius_x, 0.0, width - 1.0)
+    y_min = torch.clamp(screen_y - radius_y, 0.0, height - 1.0)
+    y_max = torch.clamp(screen_y + radius_y, 0.0, height - 1.0)
+
+    tile_x_min = torch.div(x_min, tile_size, rounding_mode="floor").to(torch.int64)
+    tile_x_max = torch.div(x_max, tile_size, rounding_mode="floor").to(torch.int64)
+    tile_y_min = torch.div(y_min, tile_size, rounding_mode="floor").to(torch.int64)
+    tile_y_max = torch.div(y_max, tile_size, rounding_mode="floor").to(torch.int64)
+
+    tile_x_min = torch.clamp(tile_x_min - tile_overlap, 0, tiles_x - 1)
+    tile_y_min = torch.clamp(tile_y_min - tile_overlap, 0, tiles_y - 1)
+    tile_x_max = torch.clamp(tile_x_max + tile_overlap, 0, tiles_x - 1)
+    tile_y_max = torch.clamp(tile_y_max + tile_overlap, 0, tiles_y - 1)
+
+    tile_x_min = torch.minimum(tile_x_min, tile_x_max)
+    tile_y_min = torch.minimum(tile_y_min, tile_y_max)
+
+    assignments = [[] for _ in range(tiles_x * tiles_y)]
+    ranges = torch.stack(
+        [tile_x_min, tile_x_max, tile_y_min, tile_y_max], dim=1
+    ).to(torch.int32)
+    for idx, (xmin, xmax, ymin, ymax) in enumerate(ranges.tolist()):
+        for ty in range(ymin, ymax + 1):
+            row_offset = ty * tiles_x
+            for tx in range(xmin, xmax + 1):
+                assignments[row_offset + tx].append(idx)
+
+    return assignments, tiles_x, tiles_y
 
 
 def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_modifier: float):

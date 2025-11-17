@@ -96,6 +96,9 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         self.backend = "diff"
+        self.enable_tiling = False
+        self.tile_size = 128
+        self.tile_overlap = 1
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
