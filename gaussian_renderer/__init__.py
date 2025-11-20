@@ -390,11 +390,11 @@ def _render_with_gsplat(
     packed_gaussians = attributes.to_packed(
         scaling_modifier=scaling_modifier, add_batch_dim=False
     )
-    # gsplat expects backgrounds shaped as (H, W, 3); expand a single RGB
-    # color to the full image while keeping batchless Gaussian inputs.
+    # gsplat expects backgrounds shaped as (C, H, W, 3); keep a single-camera
+    # batch dimension while expanding the RGB color across the image.
     backgrounds = (
-        bg_color.view(1, 1, 3)
-        .expand(height, width, 3)
+        bg_color.view(1, 1, 1, 3)
+        .expand(1, height, width, 3)
         .contiguous()
     )
 
