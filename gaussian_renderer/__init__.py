@@ -390,8 +390,13 @@ def _render_with_gsplat(
     packed_gaussians = attributes.to_packed(
         scaling_modifier=scaling_modifier, add_batch_dim=False
     )
-    # Match the (C, 3) expectation for backgrounds.
-    backgrounds = bg_color.view(1, -1)
+    # gsplat expects backgrounds shaped as (H, W, 3); expand a single RGB
+    # color to the full image while keeping batchless Gaussian inputs.
+    backgrounds = (
+        bg_color.view(1, 1, 3)
+        .expand(height, width, 3)
+        .contiguous()
+    )
 
     near_plane = float(getattr(viewpoint_camera, "znear", 0.01))
     far_plane = float(getattr(viewpoint_camera, "zfar", 100.0))
