@@ -113,7 +113,7 @@ def _split_masked_gaussians_reference(anchor, grid_scaling, color, scale_rot, of
     if anchor.shape[0] == 0 or num_offsets == 0 or mask.numel() == 0:
         return _empty_gaussian_splits(anchor, grid_scaling, color, scale_rot, offsets)
 
-    mask = mask.view(-1).to(torch.bool)
+    mask = mask.view(-1).to(device=anchor.device, dtype=torch.bool)
     if color.shape[0] != mask.shape[0]:
         raise ValueError("Mask length must match flattened gaussian attributes")
     if not mask.any():
@@ -129,7 +129,7 @@ def _split_masked_gaussians_reference(anchor, grid_scaling, color, scale_rot, of
 def _split_masked_gaussians_vectorized(anchor, grid_scaling, color, scale_rot, offsets, mask, num_offsets):
     """Vectorized gather that builds gaussian tensors via advanced indexing only."""
     num_offsets = int(num_offsets)
-    mask = mask.view(-1).to(torch.bool)
+    mask = mask.view(-1).to(device=anchor.device, dtype=torch.bool)
     total_candidates = mask.shape[0]
 
     if (
