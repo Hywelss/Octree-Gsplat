@@ -529,7 +529,9 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
         visibility = visibility[:min_len]
         mapped_indices = mapped_indices[:min_len]
 
-    visible_mask[mapped_indices] = visibility
+    # Map visibility back through the explicit anchor indices to avoid shape
+    # mismatches when the mask and packed tensors differ in dimensionality.
+    visible_mask[anchor_indices] = visibility
     return visible_mask
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier=1.0, visible_mask=None, retain_grad=False, ape_code=-1):

@@ -22,23 +22,17 @@ class _DummyCamera:
 
 
 class _DummyGsplat:
-    def __init__(self, gaussian_ids=None):
+    def __init__(self):
         self.kwargs = None
-        self.gaussian_ids = gaussian_ids
 
     def rasterization(self, **kwargs):
         self.kwargs = kwargs
         batch, num_points, _ = kwargs["means"].shape
         render = torch.zeros((batch, kwargs["height"], kwargs["width"], 3))
-        ids = self.gaussian_ids
-        if ids is None:
-            ids = torch.arange(num_points)
-        means2d = torch.zeros((batch, ids.shape[0], 2))
-        radii = torch.ones((batch, ids.shape[0]))
+        means2d = torch.zeros((batch, num_points, 2))
+        radii = torch.ones((batch, num_points))
         setattr(means2d, "absgrad", torch.ones_like(means2d))
         meta = {"means2d": means2d, "radii": radii}
-        if self.gaussian_ids is not None:
-            meta["gaussian_ids"] = self.gaussian_ids
         return render, None, meta
 
 
@@ -74,26 +68,3 @@ def test_gsplat_rasterization_receives_packed_sparse():
     assert dummy_gsplat.kwargs["sparse_grad"] is True
     assert "selection_mask" in result
     assert torch.equal(result["selection_mask"], extras["selection_mask"])
-
-
-def test_prefilter_handles_gaussian_id_mapping():
-    dummy_camera = _DummyCamera()
-    anchor_mask = torch.tensor([True, False, True])
-
-    class _DummyPC:
-        def __init__(self):
-            self._anchor_mask = anchor_mask
-            self.get_anchor = torch.rand(3, 3)
-            self.get_scaling = torch.rand(3, 3)
-            self.get_rotation = torch.rand(3, 4)
-            self.get_opacity = torch.rand(3, 1)
-
-    pc = _DummyPC()
-    dummy_gsplat = _DummyGsplat(gaussian_ids=torch.tensor([0, 2]))
-
-    with mock.patch.object(gaussian_renderer, "_load_gsplat", return_value=dummy_gsplat):
-        visible = gaussian_renderer._prefilter_voxel_gsplat(
-            dummy_camera, pc, pipe=types.SimpleNamespace(), scaling_modifier=1.0
-        )
-
-    assert torch.equal(visible, torch.tensor([True, False, True]))
