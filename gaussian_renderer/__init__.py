@@ -450,7 +450,11 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
     if not torch.any(anchor_mask):
         return visible_mask
 
-    means3D = pc.get_anchor[anchor_mask]
+    # Convert the boolean mask to explicit indices so that any subsequent
+    # gathers/scatters stay aligned even if the mask shape differs from the
+    # flattened anchor buffer.
+    anchor_indices = torch.nonzero(anchor_mask, as_tuple=False).squeeze(-1)
+    means3D = torch.index_select(pc.get_anchor, 0, anchor_indices)
     if means3D.numel() == 0:
         return visible_mask
 
@@ -462,15 +466,17 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
     viewmats = viewmat.unsqueeze(0).unsqueeze(0).contiguous()
     Ks = K.unsqueeze(0).unsqueeze(0).contiguous()
 
-    scales = pc.get_scaling[anchor_mask]
+    scales = torch.index_select(pc.get_scaling, 0, anchor_indices)
     if scales.dim() > 2:
         scales = scales[..., :3]
     else:
         scales = scales[:, :3]
     scales = scales * scaling_modifier
 
-    rotations = pc.get_rotation[anchor_mask].unsqueeze(0)
-    opacities = pc.get_opacity[anchor_mask].view(-1).unsqueeze(0)
+    rotations = torch.index_select(pc.get_rotation, 0, anchor_indices).unsqueeze(0)
+    opacities = (
+        torch.index_select(pc.get_opacity, 0, anchor_indices).view(-1).unsqueeze(0)
+    )
     colors = torch.zeros((1, means3D.shape[0], 3), device=device, dtype=dtype)
 
     width = int(viewpoint_camera.image_width)
@@ -499,7 +505,9 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
         radii = radii.amax(dim=-1)
     visibility = radii > 0
 
-    visible_mask[anchor_mask] = visibility
+    # Map visibility back through the explicit anchor indices to avoid shape
+    # mismatches when the mask and packed tensors differ in dimensionality.
+    visible_mask[anchor_indices] = visibility
     return visible_mask
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier=1.0, visible_mask=None, retain_grad=False, ape_code=-1):
