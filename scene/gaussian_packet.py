@@ -39,14 +39,27 @@ class GaussianAttributeView:
         rotations = torch.index_select(self.rotations, 0, indices).contiguous()
         return pos, color, opacity, scales, rotations
 
-    def to_packed(self, scaling_modifier: float = 1.0) -> Dict[str, torch.Tensor]:
+    def to_packed(self, scaling_modifier: float = 1.0, add_batch_dim: bool = False) -> Dict[str, torch.Tensor]:
+        """
+        Materialize tensors for gsplat.
+
+        ``gsplat`` interprets any leading dimensions as batch dimensions. When
+        ``sparse_grad=True`` it currently forbids batch dims, so we default to
+        returning rank-2 tensors. Callers can opt-in to a leading batch dim for
+        compatibility with older code paths via ``add_batch_dim=True``.
+        """
+
         means, colors, opacities, scales, quats = self.as_tuple()
+
+        def maybe_batch(t: torch.Tensor) -> torch.Tensor:
+            return t.unsqueeze(0) if add_batch_dim else t
+
         packed = {
-            "means": means.unsqueeze(0),
-            "colors": colors.unsqueeze(0),
-            "opacities": opacities.squeeze(-1).unsqueeze(0),
-            "scales": (scales * scaling_modifier).unsqueeze(0),
-            "quats": quats.unsqueeze(0),
+            "means": maybe_batch(means),
+            "colors": maybe_batch(colors),
+            "opacities": maybe_batch(opacities.squeeze(-1)),
+            "scales": maybe_batch(scales * scaling_modifier),
+            "quats": maybe_batch(quats),
         }
         return packed
 

@@ -380,11 +380,13 @@ def _render_with_gsplat(
     height = int(viewpoint_camera.image_height)
     viewmat, K = _camera_matrices(viewpoint_camera, device, dtype)
 
-    viewmats = viewmat.unsqueeze(0).unsqueeze(0).contiguous()
-    Ks = K.unsqueeze(0).unsqueeze(0).contiguous()
+    viewmats = viewmat.contiguous()
+    Ks = K.contiguous()
 
-    packed_gaussians = attributes.to_packed(scaling_modifier=scaling_modifier)
-    backgrounds = bg_color.view(1, 1, -1)
+    packed_gaussians = attributes.to_packed(
+        scaling_modifier=scaling_modifier, add_batch_dim=False
+    )
+    backgrounds = bg_color.view(-1)
 
     near_plane = float(getattr(viewpoint_camera, "znear", 0.01))
     far_plane = float(getattr(viewpoint_camera, "zfar", 100.0))
@@ -466,8 +468,8 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
     device = means3D.device
     dtype = means3D.dtype
     viewmat, K = _camera_matrices(viewpoint_camera, device, dtype)
-    viewmats = viewmat.unsqueeze(0).unsqueeze(0).contiguous()
-    Ks = K.unsqueeze(0).unsqueeze(0).contiguous()
+    viewmats = viewmat.contiguous()
+    Ks = K.contiguous()
 
     scales = torch.index_select(pc.get_scaling, 0, anchor_indices)
     if scales.dim() > 2:
@@ -476,20 +478,18 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
         scales = scales[:, :3]
     scales = scales * scaling_modifier
 
-    rotations = torch.index_select(pc.get_rotation, 0, anchor_indices).unsqueeze(0)
-    opacities = (
-        torch.index_select(pc.get_opacity, 0, anchor_indices).view(-1).unsqueeze(0)
-    )
-    colors = torch.zeros((1, means3D.shape[0], 3), device=device, dtype=dtype)
+    rotations = torch.index_select(pc.get_rotation, 0, anchor_indices)
+    opacities = torch.index_select(pc.get_opacity, 0, anchor_indices).view(-1)
+    colors = torch.zeros((means3D.shape[0], 3), device=device, dtype=dtype)
 
     width = int(viewpoint_camera.image_width)
     height = int(viewpoint_camera.image_height)
 
     with torch.no_grad():
         _, _, meta = gsplat.rasterization(
-            means=means3D.unsqueeze(0),
+            means=means3D,
             quats=rotations,
-            scales=scales.unsqueeze(0),
+            scales=scales,
             opacities=opacities,
             colors=colors,
             viewmats=viewmats,

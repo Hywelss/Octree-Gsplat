@@ -28,13 +28,19 @@ class _DummyGsplat:
 
     def rasterization(self, **kwargs):
         self.kwargs = kwargs
-        batch, num_points, _ = kwargs["means"].shape
-        render = torch.zeros((batch, kwargs["height"], kwargs["width"], 3))
+        means = kwargs["means"]
+        if means.dim() == 2:
+            num_points = means.shape[0]
+            batch_shape = ()
+        else:
+            batch_shape = means.shape[:-2]
+            num_points = means.shape[-2]
+        render = torch.zeros((*batch_shape, kwargs["height"], kwargs["width"], 3))
         ids = self.gaussian_ids
         if ids is None:
             ids = torch.arange(num_points)
-        means2d = torch.zeros((batch, ids.shape[0], 2))
-        radii = torch.ones((batch, ids.shape[0]))
+        means2d = torch.zeros((*batch_shape, ids.shape[0], 2))
+        radii = torch.ones((*batch_shape, ids.shape[0]))
         setattr(means2d, "absgrad", torch.ones_like(means2d))
         meta = {"means2d": means2d, "radii": radii}
         if self.gaussian_ids is not None:

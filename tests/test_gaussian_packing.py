@@ -18,8 +18,8 @@ def test_gaussian_view_to_packed_matches_index_select():
     packed = view.to_packed()
 
     expected_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-    assert torch.allclose(packed["means"].squeeze(0), torch.index_select(positions, 0, expected_indices))
-    assert torch.allclose(packed["colors"].squeeze(0), torch.index_select(colors, 0, expected_indices))
-    assert torch.allclose(packed["opacities"].squeeze(0), torch.index_select(opacities, 0, expected_indices).squeeze(-1))
-    assert torch.allclose(packed["scales"].squeeze(0), torch.index_select(scales, 0, expected_indices))
-    assert torch.allclose(packed["quats"].squeeze(0), torch.index_select(rotations, 0, expected_indices))
+    assert torch.allclose(packed["means"], torch.index_select(positions, 0, expected_indices))
+    assert torch.allclose(packed["colors"], torch.index_select(colors, 0, expected_indices))
+    assert torch.allclose(packed["opacities"], torch.index_select(opacities, 0, expected_indices).squeeze(-1))
+    assert torch.allclose(packed["scales"], torch.index_select(scales, 0, expected_indices))
+    assert torch.allclose(packed["quats"], torch.index_select(rotations, 0, expected_indices))
