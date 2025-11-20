@@ -380,13 +380,18 @@ def _render_with_gsplat(
     height = int(viewpoint_camera.image_height)
     viewmat, K = _camera_matrices(viewpoint_camera, device, dtype)
 
-    viewmats = viewmat.contiguous()
-    Ks = K.contiguous()
+    # gsplat expects viewmats/Ks shaped as (C,4,4)/(C,3,3) where C is the
+    # camera count; keep a single-camera batch to satisfy that contract while
+    # avoiding extra batch dimensions on the Gaussian side (sparse_grad
+    # restriction).
+    viewmats = viewmat.unsqueeze(0).contiguous()
+    Ks = K.unsqueeze(0).contiguous()
 
     packed_gaussians = attributes.to_packed(
         scaling_modifier=scaling_modifier, add_batch_dim=False
     )
-    backgrounds = bg_color.view(-1)
+    # Match the (C, 3) expectation for backgrounds.
+    backgrounds = bg_color.view(1, -1)
 
     near_plane = float(getattr(viewpoint_camera, "znear", 0.01))
     far_plane = float(getattr(viewpoint_camera, "zfar", 100.0))
@@ -468,8 +473,10 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
     device = means3D.device
     dtype = means3D.dtype
     viewmat, K = _camera_matrices(viewpoint_camera, device, dtype)
-    viewmats = viewmat.contiguous()
-    Ks = K.contiguous()
+    # Keep a single-camera dimension for gsplat without introducing additional
+    # batch dimensions that sparse_grad would reject.
+    viewmats = viewmat.unsqueeze(0).contiguous()
+    Ks = K.unsqueeze(0).contiguous()
 
     scales = torch.index_select(pc.get_scaling, 0, anchor_indices)
     if scales.dim() > 2:
