@@ -446,14 +446,17 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
     if anchor_mask is None:
         return anchor_mask
 
-    visible_mask = anchor_mask.clone()
-    if not torch.any(anchor_mask):
+    # Ensure the anchor mask is flattened so that all gathers/scatters operate on
+    # a 1-D index space. Return shape will follow the original layout.
+    anchor_mask_flat = anchor_mask.reshape(-1)
+    visible_mask = anchor_mask_flat.clone()
+    if not torch.any(anchor_mask_flat):
         return visible_mask
 
     # Convert the boolean mask to explicit indices so that any subsequent
     # gathers/scatters stay aligned even if the mask shape differs from the
     # flattened anchor buffer.
-    anchor_indices = torch.nonzero(anchor_mask, as_tuple=False).squeeze(-1)
+    anchor_indices = torch.nonzero(anchor_mask_flat, as_tuple=False).squeeze(-1)
     means3D = torch.index_select(pc.get_anchor, 0, anchor_indices)
     if means3D.numel() == 0:
         return visible_mask
@@ -524,15 +527,18 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
 
     # Fall back to length alignment if gsplat returned fewer entries (e.g., after
     # aggressive culling) to keep the scatter in-bounds.
+    visibility = visibility.reshape(-1)
+    mapped_indices = mapped_indices.reshape(-1)
     if visibility.shape[0] != mapped_indices.shape[0]:
         min_len = min(visibility.shape[0], mapped_indices.shape[0])
         visibility = visibility[:min_len]
         mapped_indices = mapped_indices[:min_len]
 
-    # Map visibility back through the explicit anchor indices to avoid shape
-    # mismatches when the mask and packed tensors differ in dimensionality.
-    visible_mask[anchor_indices] = visibility
-    return visible_mask
+    # Write only into the flattened mask to avoid broadcasting across any
+    # higher-dimensional layouts, then restore the original shape on return.
+    visible_mask = torch.zeros_like(anchor_mask_flat, dtype=visibility.dtype)
+    visible_mask[mapped_indices] = visibility
+    return visible_mask.reshape_as(anchor_mask)
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier=1.0, visible_mask=None, retain_grad=False, ape_code=-1):
     """
