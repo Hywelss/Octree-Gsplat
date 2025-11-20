@@ -17,6 +17,7 @@ from typing import Optional
 
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
+from scene.gaussian_packet import GaussianAttributeBuffer, GaussianAttributeView
 from utils.graphics_utils import fov2focal
 
 _GSPLAT_MODULE = None
@@ -172,16 +173,36 @@ def _split_masked_gaussians_vectorized(anchor, grid_scaling, color, scale_rot, o
     return selected_scaling, selected_anchor, selected_color, selected_scale_rot, selected_offsets
 
 
-def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False,  ape_code=-1):
-    ## view frustum filtering for acceleration    
+def generate_neural_gaussians(viewpoint_camera, pc: GaussianModel, visible_mask=None, is_training=False, ape_code=-1):
+    device = pc.get_anchor.device
+    scaling_all = pc.get_scaling
     if visible_mask is None:
-        visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
+        visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device=device)
 
-    anchor = pc.get_anchor[visible_mask]
-    feat = pc.get_anchor_feat[visible_mask]
-    level = pc.get_level[visible_mask]
-    grid_offsets = pc._offset[visible_mask]
-    grid_scaling = pc.get_scaling[visible_mask]
+    active_anchor_indices = pc.gather_anchor_indices(visible_mask)
+    if active_anchor_indices.numel() == 0:
+        scaling_dim = scaling_all.shape[-1]
+        extras = None
+        if is_training:
+            extras = {
+                "selection_mask": torch.zeros((0,), dtype=torch.bool, device=device),
+                "neural_opacity": torch.zeros((0, 1), device=device),
+                "scaling": torch.zeros((0, scaling_dim), device=device),
+            }
+        return GaussianAttributeBuffer.from_tensors(
+            positions=torch.zeros((0, 3), device=device),
+            colors=torch.zeros((0, 3), device=device),
+            opacities=torch.zeros((0, 1), device=device),
+            scales=torch.zeros((0, scaling_dim), device=device),
+            rotations=torch.zeros((0, 4), device=device),
+            extras=extras,
+        )
+
+    anchor = torch.index_select(pc.get_anchor, 0, active_anchor_indices)
+    feat = torch.index_select(pc.get_anchor_feat, 0, active_anchor_indices)
+    level = torch.index_select(pc.get_level, 0, active_anchor_indices)
+    grid_offsets = torch.index_select(pc._offset, 0, active_anchor_indices)
+    grid_scaling = torch.index_select(scaling_all, 0, active_anchor_indices)
 
     ## get view properties for anchor
     ob_view = anchor - viewpoint_camera.camera_center
@@ -232,8 +253,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
     
     if pc.dist2level=="progressive":
-        prog = pc._prog_ratio[visible_mask]
-        transition_mask = pc.transition_mask[visible_mask]
+        prog = torch.index_select(pc._prog_ratio, 0, active_anchor_indices)
+        transition_mask = torch.index_select(pc.transition_mask, 0, active_anchor_indices)
         prog[~transition_mask] = 1.0
         neural_opacity = neural_opacity * prog
 
@@ -293,10 +314,21 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     offsets = offsets * scaling_repeat[:,:3]
     xyz = repeat_anchor + offsets 
 
+    extras = None
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask
-    else:
-        return xyz, color, opacity, scaling, rot
+        extras = {
+            "selection_mask": mask,
+            "neural_opacity": neural_opacity,
+            "scaling": scaling,
+        }
+    return GaussianAttributeBuffer.from_tensors(
+        positions=xyz,
+        colors=color,
+        opacities=opacity,
+        scales=scaling,
+        rotations=rot,
+        extras=extras,
+    )
 
 
 def _render_with_gsplat(
@@ -306,15 +338,15 @@ def _render_with_gsplat(
     bg_color: torch.Tensor,
     scaling_modifier: float,
     retain_grad: bool,
-    xyz: torch.Tensor,
-    color: torch.Tensor,
-    opacity: torch.Tensor,
-    scaling: torch.Tensor,
-    rot: torch.Tensor,
+    attributes: GaussianAttributeView,
     is_training: bool,
-    neural_opacity: Optional[torch.Tensor],
-    mask: Optional[torch.Tensor],
 ):
+    xyz, color, opacity, scaling, rot = attributes.as_tuple()
+    extras = attributes.get_extras()
+    selection_mask = extras.get("selection_mask") if extras else None
+    neural_opacity = extras.get("neural_opacity") if extras else None
+    scaling_cache = extras.get("scaling") if extras else scaling
+
     if xyz.numel() == 0:
         height = int(viewpoint_camera.image_height)
         width = int(viewpoint_camera.image_width)
@@ -333,9 +365,9 @@ def _render_with_gsplat(
         if is_training:
             result.update(
                 {
-                    "selection_mask": mask,
+                    "selection_mask": selection_mask,
                     "neural_opacity": neural_opacity,
-                    "scaling": scaling,
+                    "scaling": scaling_cache,
                 }
             )
         return result
@@ -351,21 +383,14 @@ def _render_with_gsplat(
     viewmats = viewmat.unsqueeze(0).unsqueeze(0).contiguous()
     Ks = K.unsqueeze(0).unsqueeze(0).contiguous()
 
-    scales = (scaling * scaling_modifier).unsqueeze(0)
-    quats = rot.unsqueeze(0)
-    opacities = opacity.squeeze(-1).unsqueeze(0)
-    colors = color.unsqueeze(0)
+    packed_gaussians = attributes.to_packed(scaling_modifier=scaling_modifier)
     backgrounds = bg_color.view(1, 1, -1)
 
     near_plane = float(getattr(viewpoint_camera, "znear", 0.01))
     far_plane = float(getattr(viewpoint_camera, "zfar", 100.0))
 
     render_colors, _, meta = gsplat.rasterization(
-        means=xyz.unsqueeze(0),
-        quats=quats,
-        scales=scales,
-        opacities=opacities,
-        colors=colors,
+        **packed_gaussians,
         viewmats=viewmats,
         Ks=Ks,
         width=width,
@@ -373,7 +398,8 @@ def _render_with_gsplat(
         near_plane=near_plane,
         far_plane=far_plane,
         backgrounds=backgrounds,
-        packed=False,
+        packed=True,
+        sparse_grad=is_training,
         absgrad=retain_grad,
     )
 
@@ -407,9 +433,9 @@ def _render_with_gsplat(
     if is_training:
         result.update(
             {
-                "selection_mask": mask,
+                "selection_mask": selection_mask,
                 "neural_opacity": neural_opacity,
-                "scaling": scaling,
+                "scaling": scaling_cache,
             }
         )
     return result
@@ -464,7 +490,8 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
             near_plane=float(getattr(viewpoint_camera, "znear", 0.01)),
             far_plane=float(getattr(viewpoint_camera, "zfar", 100.0)),
             backgrounds=None,
-            packed=False,
+            packed=True,
+            sparse_grad=False,
         )
 
     radii = _squeeze_leading_dims(meta["radii"])
@@ -483,12 +510,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     """
 
     is_training = pc.get_color_mlp.training
-    neural_opacity = None
-    mask = None
-    if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    else:
-        xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, ape_code=ape_code)
+    gaussian_view = generate_neural_gaussians(
+        viewpoint_camera,
+        pc,
+        visible_mask,
+        is_training=is_training,
+        ape_code=ape_code,
+    )
+    extras = gaussian_view.get_extras()
+    xyz, color, opacity, scaling, rot = gaussian_view.as_tuple()
 
     backend = _get_backend(pipe)
     if backend == "gsplat":
@@ -499,14 +529,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             bg_color=bg_color,
             scaling_modifier=scaling_modifier,
             retain_grad=retain_grad,
-            xyz=xyz,
-            color=color,
-            opacity=opacity,
-            scaling=scaling,
-            rot=rot,
+            attributes=gaussian_view,
             is_training=is_training,
-            neural_opacity=neural_opacity,
-            mask=mask,
         )
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -551,14 +575,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:
-        return {"render": rendered_image,
-                "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
-                "radii": radii,
-                "selection_mask": mask,
-                "neural_opacity": neural_opacity,
-                "scaling": scaling,
-                }
+        return {
+            "render": rendered_image,
+            "viewspace_points": screenspace_points,
+            "visibility_filter": radii > 0,
+            "radii": radii,
+            "selection_mask": extras.get("selection_mask"),
+            "neural_opacity": extras.get("neural_opacity"),
+            "scaling": scaling,
+        }
     else:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,

@@ -26,6 +26,8 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
 from einops import repeat
 import math
+from typing import Optional
+from scene.octree_linear import MortonLinearOctree
     
 class GaussianModel:
 
@@ -96,7 +98,7 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
-        
+
         self.offset_gradient_accum = torch.empty(0)
         self.offset_denom = torch.empty(0)
 
@@ -106,6 +108,7 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        self._linear_octree = None
 
         self.opacity_dist_dim = 1 if self.add_opacity_dist else 0
         self.cov_dist_dim = 1 if self.add_cov_dist else 0
@@ -235,7 +238,43 @@ class GaussianModel:
     @property
     def get_featurebank_mlp(self):
         return self.mlp_feature_bank
-    
+
+    def _current_aabb(self):
+        if self._anchor.numel() == 0:
+            zero = torch.zeros(3, device=self._anchor.device)
+            return zero, zero
+        min_bound = torch.amin(self._anchor.detach(), dim=0)
+        max_bound = torch.amax(self._anchor.detach(), dim=0)
+        return min_bound, max_bound
+
+    def rebuild_linear_octree(self):
+        if self._anchor.numel() == 0:
+            self._linear_octree = None
+            return
+        min_bound, max_bound = self._current_aabb()
+        self._linear_octree = MortonLinearOctree(
+            positions=self._anchor.detach(),
+            levels=self._level.detach(),
+            aabb=(min_bound, max_bound),
+        )
+
+    def get_linear_octree(self) -> Optional[MortonLinearOctree]:
+        if self._linear_octree is None:
+            if self._anchor.numel() == 0:
+                return None
+            self.rebuild_linear_octree()
+        return self._linear_octree
+
+    def gather_anchor_indices(self, visible_mask=None):
+        if self._anchor.numel() == 0:
+            return torch.zeros((0,), dtype=torch.long, device=self._anchor.device)
+        octree = self.get_linear_octree()
+        if visible_mask is None or octree is None:
+            return torch.arange(
+                self._anchor.shape[0], device=self._anchor.device, dtype=torch.long
+            )
+        return octree.indices_from_mask(visible_mask)
+
     def set_appearance(self, num_cameras):
         if self.appearance_dim > 0:
             self.embedding_appearance = Embedding(num_cameras, self.appearance_dim).cuda()
@@ -348,6 +387,7 @@ class GaussianModel:
         self._level = self._level.unsqueeze(dim=1)
         self._extra_level = torch.zeros(self._anchor.shape[0], dtype=torch.float, device="cuda")
         self._anchor_mask = torch.ones(self._anchor.shape[0], dtype=torch.bool, device="cuda")
+        self.rebuild_linear_octree()
 
     def map_to_int_level(self, pred_level, cur_level):
         if self.dist2level=='floor':
@@ -586,6 +626,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(False))
         self._anchor_mask = torch.ones(self._anchor.shape[0], dtype=torch.bool, device="cuda")
         self.levels = torch.max(self._level) - torch.min(self._level) + 1
+        self.rebuild_linear_octree()
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -703,9 +744,10 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        self._level = self._level[valid_points_mask]    
+        self._level = self._level[valid_points_mask]
         self._extra_level = self._extra_level[valid_points_mask]
-    
+        self.rebuild_linear_octree()
+
     def get_remove_duplicates(self, grid_coords, selected_grid_coords_unique, use_chunk = True):
         if use_chunk:
             chunk_size = 4096
