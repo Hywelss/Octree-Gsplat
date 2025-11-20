@@ -503,7 +503,9 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
     radii = _squeeze_leading_dims(meta["radii"])
     if radii.dim() > 1:
         radii = radii.amax(dim=-1)
-    visibility = radii > 0
+    # Flatten to a simple 1-D vector so downstream length checks/scatters are
+    # unambiguous even if gsplat changes its packing layout.
+    visibility = (radii > 0).reshape(-1)
 
     # Prefer gsplat-provided gaussian_ids (if present) to map the packed
     # radii/visibility back to the original anchor indices. This avoids shape
@@ -512,8 +514,13 @@ def _prefilter_voxel_gsplat(viewpoint_camera, pc: GaussianModel, pipe, scaling_m
     if isinstance(meta, dict):
         gaussian_ids = meta.get("gaussian_ids")
         if gaussian_ids is not None:
-            gaussian_ids = _squeeze_leading_dims(gaussian_ids).to(anchor_indices.device)
-            mapped_indices = torch.index_select(anchor_indices, 0, gaussian_ids.long())
+            gaussian_ids = (
+                _squeeze_leading_dims(gaussian_ids)
+                .reshape(-1)
+                .to(anchor_indices.device)
+                .long()
+            )
+            mapped_indices = torch.index_select(anchor_indices, 0, gaussian_ids)
 
     # Fall back to length alignment if gsplat returned fewer entries (e.g., after
     # aggressive culling) to keep the scatter in-bounds.
